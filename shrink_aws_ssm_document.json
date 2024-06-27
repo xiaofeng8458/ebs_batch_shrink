@@ -1,0 +1,145 @@
+{
+  "schemaVersion": "0.3",
+  "description": "*Replace this default text with instructions or other information about your runbook.*\n\n---\n# What is Markdown?\nMarkdown is a lightweight markup language that converts your content with plain text formatting to structurally valid rich text.\n## You can add headings\nYou can add *italics* or make the font **bold**.\n1. Create numbered lists\n* Add bullet points\n>Indent `code samples`\n\nYou can create a [link to another webpage](https://aws.amazon.com).",
+  "parameters": {
+    "RegionInfo": {
+      "type": "String",
+      "description": "Provided the Running Region Information",
+      "default": ""
+    },
+    "InstanceId": {
+      "type": "String",
+      "description": "Attache Instance ID",
+      "default": ""
+    },
+    "NewVolumeSize": {
+      "type": "Integer",
+      "description": "New Volume Size Defined"
+    },
+    "NewVolumeDev": {
+      "type": "String",
+      "description": "New Volume Dev Info"
+    },
+    "NewVolumeDir": {
+      "type": "String",
+      "description": "Temp Mounted Directory Information for new Volume when rsyncing"
+    },
+    "InstanceTagKey": {
+      "type": "String",
+      "description": "Key for Selected Instance"
+    },
+    "InstanceTagValue": {
+      "type": "String",
+      "description": "Value for selected Instance Tag"
+    }
+  },
+  "assumeRole": "arn:aws:iam::267803665100:role/access-peg-engineering",
+  "mainSteps": [
+    {
+      "description": "GetListOfInstances",
+      "name": "GetListOfInstancesviaTag",
+      "action": "aws:executeScript",
+      "nextStep": "LoopThroughTheInstances",
+      "isEnd": false,
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.8",
+        "Handler": "script_handler",
+        "InputPayload": {
+          "instance_key": "{{ InstanceTagKey }}",
+          "instance_value": "{{ InstanceTagValue }}"
+        },
+        "Script": "import boto3\n\ndef get_instances_by_tag(tag_key, tag_value):\n    \"\"\"\n    Get a list of EC2 instance IDs that have a specific tag key and value.\n\n    Args:\n        tag_key (str): The key of the tag to filter by.\n        tag_value (str): The value of the tag to filter by.\n\n    Returns:\n        list: A list of EC2 instance IDs that match the tag key and value.\n    \"\"\"\n    ec2 = boto3.client('ec2')\n\n    # Filter instances by tag\n    filters = [\n        {\n            'Name': f'tag:{tag_key}',\n            'Values': [tag_value]\n        }\n    ]\n\n    # Get a list of instances matching the filter\n    response = ec2.describe_instances(Filters=filters)\n\n    # Extract instance IDs from the response\n    instance_ids = [instance['InstanceId'] for reservation in response['Reservations']\n                    for instance in reservation['Instances']]\n\n    print(instance_ids)\n    return instance_ids\n\ndef script_handler(event, context):\n    tag_key = event['instance_key']\n    tag_value = event['instance_value']\n\n    instance_ids = get_instances_by_tag(tag_key, tag_value)\n    \n    return {\"instance_ids\": instance_ids}"
+      },
+      "outputs": [
+        {
+          "Type": "StringList",
+          "Selector": "$.Payload.instance_ids",
+          "Name": "InstanceIdList"
+        }
+      ]
+    },
+    {
+      "name": "LoopThroughTheInstances",
+      "action": "aws:loop",
+      "isEnd": true,
+      "inputs": {
+        "Iterators": "{{ GetListOfInstancesviaTag.InstanceIdList }}",
+        "Steps": [
+          {
+            "description": "get environment information",
+            "name": "performanVolumeActions",
+            "action": "aws:executeScript",
+            "isEnd": true,
+            "onCancel": "step:ReplaceVolumeShell",
+            "onFailure": "Abort",
+            "inputs": {
+              "Runtime": "python3.9",
+              "Handler": "script_handler",
+              "InputPayload": {
+                "region": "{{RegionInfo}}",
+                "instance_id": "{{ LoopThroughTheInstances.CurrentIteratorValue }}",
+                "new_volume_size": "{{NewVolumeSize}}",
+                "new_volume_dev": "{{NewVolumeDev}}",
+                "new_volume_dir": "{{NewVolumeDir}}"
+              },
+              "Script": "import time\nfrom datetime import datetime, timedelta, tzinfo\n\nimport boto3\n\n\nclient = boto3.client(\"ec2\")\n\n\ndef upload_param_to_instance(instance_id, old_volume_device, new_volume_device, new_volume_dir):\n\n    ssm = boto3.client('ssm')\n\n    # Define the parameters as a shell script to create a temporary file\n    parameters = f\"\"\"\n    echo \"OLD_VOLUME_DEVICE='{old_volume_device}'\" > /tmp/params.txt\n    echo \"NEW_VOLUME_DEVICE='{new_volume_device}'\" >> /tmp/params.txt\n    echo \"NEW_VOLUME_DIR='{new_volume_dir}'\" >> /tmp/params.txt\n    \"\"\"\n\n    # Run the SSM command on the instance\n    response = ssm.send_command(\n        InstanceIds=[instance_id],\n        DocumentName='AWS-RunShellScript',\n        Parameters={'commands': [parameters]}\n    )\n\n    # Return the command ID\n    command_id = response['Command']['CommandId']\n    return command_id\n\n\n# Function to list volume information for an instance\ndef list_instance_volumes(instance_id):\n    try:\n        # Get the instance details\n        instance = client.describe_instances(InstanceIds=[instance_id])['Reservations'][0]['Instances'][0]\n\n        root_volume_name = instance['RootDeviceName']\n        volume_az_info = instance['Placement']['AvailabilityZone']\n        # Get the volume IDs attached to the instance\n        volume_ids = [volume['Ebs']['VolumeId'] for volume in instance['BlockDeviceMappings']]\n\n        # If there are no volumes attached, print a message and return\n        if not volume_ids:\n            print(f\"No volumes attached to instance {instance_id}\")\n            return\n\n        # Get the volume details\n        volumes = client.describe_volumes(VolumeIds=volume_ids)['Volumes']\n\n        # Print the volume information\n        print(f\"Volumes attached to instance {instance_id}:\")\n        for volume in volumes:\n            if volume['Attachments'][0]['Device'] != root_volume_name:\n              print(f\"  Volume ID: {volume['VolumeId']}\")\n              volume_id = volume['VolumeId']\n              print(f\"  Volume Type: {volume['VolumeType']}\")\n              print(f\"  Size (GiB): {volume['Size']}\")\n              volume_size = volume['Size']\n              print(f\"  Availability Zone: {volume['AvailabilityZone']}\")\n              print(f\"  State: {volume['State']}\")\n              print(\"  Attachments:\")\n              for attachment in volume['Attachments']:\n                  print(f\"    Instance ID: {attachment['InstanceId']}\")\n                  print(f\"    Device: {attachment['Device']}\")\n                  volume_device = attachment['Device']\n                  print(f\"    State: {attachment['State']}\")\n                  print(f\"    Attach Time: {attachment['AttachTime']}\")\n              print(\"-\" * 30)\n\n    except Exception as e:\n        print(f\"Error: {e}\")\n\n    return volume_az_info, volume_id, volume_size, volume_device\n\ndef create_gp3_volume(availability_zone, size):\n    try:\n        # Create the volume\n        volume = client.create_volume(\n            AvailabilityZone=availability_zone,\n            Size=size,\n            VolumeType='gp3'\n        )\n\n        volume_id = volume['VolumeId']\n\n\n        # Wait for the volume to be available\n        waiter = client.get_waiter('volume_available')\n        waiter.wait(\n            VolumeIds=[volume['VolumeId']],\n            WaiterConfig={\n                'Delay': 5,\n                'MaxAttempts': 120\n            }\n        )\n\n        ## check the volume status\n        response = client.describe_volumes(VolumeIds=[volume['VolumeId']])\n        volume_status = response['Volumes'][0]['State']\n\n        # Print the volume status\n        print(f\"Volume {volume_id} status: {volume['State']}\")\n\n        print(f\"Volume {volume_id} created successfully.\")\n        print(f\"Volume Type: {volume['VolumeType']}\")\n        print(f\"Size: {volume['Size']} GiB\")\n        print(f\"Availability Zone: {volume['AvailabilityZone']}\")\n        print(f\"Provisioned IOPS: {volume['Iops']}\")\n\n        return volume\n\n\n    except Exception as e:\n        print(f\"Error: {e}\")\n\n\n# Function to attach a volume to an instance\ndef attach_volume_to_instance(volume_id, instance_id, device):\n    try:\n\n        # Attach the volume to the instance\n        response = client.attach_volume(\n            Device=device,\n            InstanceId=instance_id,\n            VolumeId=volume_id\n        )\n\n        # Print the attachment details\n        print(f\"Volume {volume_id} attached to instance {instance_id} at {device}\")\n        print(f\"Attachment state: {response['State']}\")\n        print(f\"Attachment time: {response['AttachTime']}\")\n\n    except Exception as e:\n        print(f\"Error: {e}\")\n\n\ndef script_handler(event, context):\n    print('---- Step1 ---- : Get the environment information')\n\n    region = event['region'].lower()\n    instance_id = event['instance_id'].strip()\n    new_volume_size = event['new_volume_size']\n    device = event['new_volume_dev']\n    new_volume_dir = event['new_volume_dir']\n\n    volume_az, volume_id, volume_size, volume_deivce =   list_instance_volumes(instance_id)\n    print(volume_az, volume_id, volume_size, volume_deivce)\n\n    print('---- Step2 ---- : Create the volume in the same az as the current data volume')\n    new_volume = create_gp3_volume(volume_az, new_volume_size)\n\n    print('---- Step3 ---- : Attach the volume to instance')\n    attach_volume_to_instance(new_volume['VolumeId'], instance_id, device)\n\n    print('---- Step4 ----: Find a way to pass more params to the execution shell')\n    upload_param_to_instance(instance_id, volume_deivce, device, new_volume_dir)\n\n    # print(events[\"parameter\"])\n    new_volume_id = new_volume['VolumeId']\n    return {\n      'message': 'Hello',\n      'old_volume_id': volume_id,\n      'old_volume_dev': volume_deivce,\n      'new_volume_id': new_volume_id,\n    }"
+            },
+            "outputs": [
+              {
+                "Type": "String",
+                "Name": "OldVolumeId",
+                "Selector": "$.Payload.old_volume_id"
+              },
+              {
+                "Type": "String",
+                "Name": "OldVolumeDev",
+                "Selector": "$.Payload.old_volume_dev"
+              },
+              {
+                "Type": "String",
+                "Name": "newVolumeId",
+                "Selector": "$.Payload.new_volume_id"
+              }
+            ]
+          },
+          {
+            "name": "ReplaceVolumeShell",
+            "action": "aws:runCommand",
+            "isEnd": true,
+            "onCancel": "step:DetachOldVolumenTag",
+            "onFailure": "Abort",
+            "inputs": {
+              "DocumentName": "AWS-RunShellScript",
+              "Parameters": {
+                "commands": [
+                  "echo {{InstanceId}}"
+                ]
+              },
+              "InstanceIds": [
+                "{{ LoopThroughTheInstances.CurrentIteratorValue }}"
+              ]
+            }
+          },
+          {
+            "name": "DetachOldVolumenTag",
+            "action": "aws:executeScript",
+            "isEnd": true,
+            "onCancel": "Abort",
+            "onFailure": "Abort",
+            "inputs": {
+              "Runtime": "python3.8",
+              "Handler": "script_handler",
+              "InputPayload": {
+                "old_volume_dev": "{{performanVolumeActions.OldVolumeDev}}",
+                "old_volume_id": "{{performanVolumeActions.OldVolumeId}}",
+                "instance_id": "{{ LoopThroughTheInstances.CurrentIteratorValue }}"
+              },
+              "Script": "import time\nfrom datetime import datetime, timedelta, tzinfo\n\nimport boto3\n\n\nclient = boto3.client(\"ec2\")\n\ndef tag_ebs_volume(volume_id):\n  # Get the current date and time\n  current_time = datetime.now().strftime(\"%Y:%m:%d %H:%M:%S\")\n\n  # Create the tags\n  tags = [\n      {\n          'Key': 'OP',\n          'Value': 'EBS_SHRINK'\n      },\n      {\n          'Key': 'TIME_TAG',\n          'Value': current_time\n      }\n  ]\n\n  # Tag the volume\n  response = client.create_tags(\n      Resources=[volume_id],\n      Tags=tags\n  )\n\n  # Print the response\n  print(response)\n\ndef script_handler(event, context):\n  volume_dev = event['old_volume_dev']\n  volume_id = event['old_volume_id']\n  instance_id = event['instance_id']\n\n  print('volume_id: ' + volume_id)\n  print('volume_dev: ' + volume_dev)\n\n  # Detach the volume from the instance\n  response = client.detach_volume(\n      VolumeId=volume_id,\n      Force=True,\n      InstanceId=instance_id,\n      Device=volume_dev  # Specify the device name of the attached volume\n  )\n\n\n  tag_ebs_volume(volume_id)\n  return {'message': 'Hello'}"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
